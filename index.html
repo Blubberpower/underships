@@ -1651,6 +1651,35 @@ h1,h2,h3,p{margin-top:0} h1{font-size:27px;margin-bottom:3px} h2{font-size:20px}
 }
 
 
+/* V13.1 — mobile-safe VS CPU setup scrolling. */
+#multiplayerMenu .modal-card.mode-cpu-card{
+  max-height:calc(100vh - 24px);
+  max-height:calc(100dvh - 24px);
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  -webkit-overflow-scrolling:touch;
+  scrollbar-gutter:stable;
+}
+@media(max-width:620px), (max-height:760px){
+  #multiplayerMenu .modal-card.mode-cpu-card{
+    width:min(580px,100%);
+    max-height:calc(100vh - 36px);
+    max-height:calc(100dvh - 36px);
+    padding-bottom:14px;
+  }
+  #multiplayerMenu .mode-cpu-card .cpu-setup-actions{
+    position:sticky;
+    bottom:-14px;
+    z-index:4;
+    margin-left:-20px;
+    margin-right:-20px;
+    margin-bottom:-14px;
+    padding:12px 20px 14px;
+    background:linear-gradient(180deg,rgba(13,28,45,0),#0d1c2d 18px,#0d1c2d 100%);
+  }
+}
+
+
 /* V16 — USA / Texas Hold'em / ICBM */
 .texas-toggle{
   display:inline-flex;
@@ -2873,7 +2902,7 @@ function renderCpuConfigMenu(){
     </div>
 
     <div class="notice" style="margin-top:12px;text-align:left"><strong>Fair-play CPU</strong><br><span class="small">Both difficulties attack from information the CPU has actually learned rather than reading your hidden board. With Blind Pick enabled, the CPU's random nation is hidden during your fleet construction and revealed only after both fleets lock.</span></div>
-    <div class="row" style="justify-content:center;margin-top:14px"><button type="button" class="primary" id="confirmCpuSetupBtn">Start VS CPU Match</button><button type="button" id="cpuSetupBackBtn">Back</button></div>`);
+    <div class="row cpu-setup-actions" style="justify-content:center;margin-top:14px"><button type="button" class="primary" id="confirmCpuSetupBtn">Start VS CPU Match</button><button type="button" id="cpuSetupBackBtn">Back</button></div>`,{cpu:true});
   const cpuBlindInput=$('#cpuBlindPick'),cpuNationSelect=$('#cpuNationSelect'),cpuNationBlindNote=$('#cpuNationBlindNote');
   if(cpuBlindInput)cpuBlindInput.onchange=()=>{
     const enabled=!!cpuBlindInput.checked;
@@ -2926,6 +2955,7 @@ function setModeMenu(markup,options={}){
   const body=$('#modeMenuBody'),card=$('#multiplayerMenu .modal-card');
   if(body)body.innerHTML=markup;
   card?.classList.toggle('mode-home-card',!!options.home);
+  card?.classList.toggle('mode-cpu-card',!!options.cpu);
   showModeMenu();
 }
 function renderModeHome(){
