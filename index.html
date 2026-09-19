@@ -1680,6 +1680,40 @@ h1,h2,h3,p{margin-top:0} h1{font-size:27px;margin-bottom:3px} h2{font-size:20px}
 }
 
 
+
+/* V13.2 — mobile online reliability / reconnect UI. */
+#multiplayerMenu .modal-card.mode-online-reconnect-card{
+  max-height:calc(100vh - 24px);
+  max-height:calc(100dvh - 24px);
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  -webkit-overflow-scrolling:touch;
+}
+.online-reconnect-panel{
+  margin:14px 0 0;
+  padding:12px;
+  border:1px solid rgba(96,165,250,.32);
+  border-radius:12px;
+  background:rgba(8,19,31,.78);
+  text-align:left;
+}
+.online-reconnect-head{display:flex;align-items:center;gap:9px;font-weight:900;color:#dbeafe}
+.online-reconnect-spinner{
+  width:12px;height:12px;flex:0 0 12px;border-radius:50%;
+  background:#60a5fa;box-shadow:0 0 10px rgba(96,165,250,.7);
+  animation:cpuPulse 1s ease-in-out infinite alternate;
+}
+.online-reconnect-detail{margin-top:7px;font-size:11px;line-height:1.4;color:var(--muted)}
+.online-reconnect-room{margin-top:8px;font:800 11px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace;color:#fde68a;overflow-wrap:anywhere}
+.online-reconnect-actions{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin-top:14px}
+.online-reconnect-actions button{min-width:132px}
+@media(max-width:620px), (max-height:760px){
+  #multiplayerMenu .modal-card.mode-online-reconnect-card{max-height:calc(100dvh - 36px)}
+  .online-reconnect-actions{position:sticky;bottom:-20px;z-index:4;margin-left:-20px;margin-right:-20px;margin-bottom:-20px;padding:12px 20px 16px;background:linear-gradient(180deg,rgba(13,28,45,0),#0d1c2d 18px,#0d1c2d 100%)}
+  .online-reconnect-actions button{flex:1 1 150px;min-height:44px}
+}
+@media(prefers-reduced-motion:reduce){.online-reconnect-spinner{animation:none}}
+
 /* V16 — USA / Texas Hold'em / ICBM */
 .texas-toggle{
   display:inline-flex;
@@ -2342,6 +2376,15 @@ let onlineConnected=false;
 let applyingRemoteState=false;
 let roomCode='';
 let connectionLost=false;
+let reconnectTimer=null;
+let reconnectAttempt=0;
+let reconnecting=false;
+let heartbeatTimer=null;
+let heartbeatAwaitingSince=0;
+let lastOnlineActivity=0;
+let connectionAttemptStartedAt=0;
+let connectionGeneration=0;
+const ONLINE_HEARTBEAT_MS=6000, ONLINE_STALL_MS=18000, ONLINE_MAX_RETRY_MS=8000;
 let configuredBudget=DEFAULT_START;
 let configuredBlindPick=false;
 let playerNames=['Player 1','Player 2'];
@@ -2946,6 +2989,7 @@ function updateModeSubtitle(){
   if(playMode==='local')el.textContent=`Russia · Japan · Indonesia · Brazil · Germany · China · Iran · United Kingdom · United States of America · Israel · Local Hotseat${state?.blindPick?' · Blind Pick':''}`;
   else if(playMode==='cpu')el.textContent=`Russia · Japan · Indonesia · Brazil · Germany · China · Iran · United Kingdom · United States of America · Israel · VS ${configuredCpuDifficulty==='advanced'?'Advanced':'Easy'} CPU${state?.blindPick?' · Blind Pick':''} · ${state?.players?.[0]?.name||playerNames[0]} vs CPU`;
   else if(playMode==='online'&&onlineConnected)el.textContent=`Russia · Japan · Indonesia · Brazil · Germany · China · Iran · United Kingdom · United States of America · Israel · Online Multiplayer${state?.blindPick?' · Blind Pick':''} · ${state?.players?.[onlineRole]?.name||playerNames[onlineRole]}`;
+  else if(playMode==='online'&&reconnecting)el.textContent='Russia · Japan · Indonesia · Brazil · Germany · China · Iran · United Kingdom · United States of America · Israel · Online Multiplayer · Reconnecting…';
   else if(playMode==='online')el.textContent='Russia · Japan · Indonesia · Brazil · Germany · China · Iran · United Kingdom · United States of America · Israel · Connecting Online…';
   else el.textContent='Russia · Japan · Indonesia · Brazil · Germany · China · Iran · United Kingdom · United States of America · Israel · Choose Local, CPU, or Online';
 }
@@ -2956,6 +3000,7 @@ function setModeMenu(markup,options={}){
   if(body)body.innerHTML=markup;
   card?.classList.toggle('mode-home-card',!!options.home);
   card?.classList.toggle('mode-cpu-card',!!options.cpu);
+  card?.classList.toggle('mode-online-reconnect-card',!!options.onlineReconnect);
   showModeMenu();
 }
 function renderModeHome(){
@@ -3061,10 +3106,132 @@ function renderConnectingMenu(status){
   setModeMenu(`<h2 id="modeMenuTitle">Connecting…</h2><p>${escapeHtml(status)}</p><div class="online-status"><span class="online-dot"></span>Establishing peer-to-peer connection</div><div style="margin-top:14px"><button type="button" id="cancelOnlineBtn">Cancel</button></div>`);
   $('#cancelOnlineBtn').onclick=()=>leaveToMenu(false);
 }
-function showConnectionLost(message='The other player disconnected.'){
-  if(playMode!=='online')return;onlineConnected=false;connectionLost=true;updateModeSubtitle();
-  setModeMenu(`<h2 id="modeMenuTitle">Connection Lost</h2><p>${escapeHtml(message)}</p><div class="row" style="justify-content:center;margin-top:14px"><button type="button" class="primary" id="lostMenuBtn">Return to Game Mode Menu</button></div>`);
-  $('#lostMenuBtn').onclick=()=>leaveToMenu(false);
+function clearReconnectTimer(){if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}}
+function stopOnlineHeartbeat(){if(heartbeatTimer){clearInterval(heartbeatTimer);heartbeatTimer=null;}heartbeatAwaitingSince=0;}
+function noteOnlineActivity(){lastOnlineActivity=Date.now();heartbeatAwaitingSince=0;}
+function onlineRetryDelay(){return Math.min(ONLINE_MAX_RETRY_MS,700*Math.pow(1.65,Math.min(reconnectAttempt,8)));}
+function renderReconnectMenu(message='Connection interrupted. Reconnecting automatically…'){
+  if(playMode!=='online')return;
+  const roleLabel=onlineRole===0?'Host':'Player 2';
+  const networkLine=navigator.onLine===false?'Your device currently appears to be offline. Reconnection will resume automatically when internet access returns.':'The match is paused while the connection is restored. No moves can be made while disconnected.';
+  setModeMenu(`<h2 id="modeMenuTitle">Reconnecting…</h2><p>${escapeHtml(message)}</p>
+    <div class="online-reconnect-panel">
+      <div class="online-reconnect-head"><span class="online-reconnect-spinner"></span><span>Restoring online match</span></div>
+      <div class="online-reconnect-detail">${escapeHtml(networkLine)} On phones, you can safely return after briefly switching apps or locking the screen.</div>
+      <div class="online-reconnect-room">${escapeHtml(roleLabel)} · Room ${escapeHtml(roomCode||'unknown')}</div>
+    </div>
+    <div class="online-reconnect-actions"><button type="button" class="primary" id="retryOnlineBtn">Retry Now</button><button type="button" id="lostMenuBtn">Return to Game Mode Menu</button></div>`,{onlineReconnect:true});
+  const retry=$('#retryOnlineBtn');if(retry)retry.onclick=()=>{reconnectAttempt=0;attemptOnlineReconnect(true);};
+  const leave=$('#lostMenuBtn');if(leave)leave.onclick=()=>leaveToMenu(false);
+}
+function scheduleOnlineReconnect(delay=onlineRetryDelay()){
+  if(playMode!=='online'||onlineConnected)return;
+  clearReconnectTimer();
+  reconnectTimer=setTimeout(()=>{reconnectTimer=null;attemptOnlineReconnect(false);},Math.max(0,delay));
+}
+function beginOnlineReconnect(message='The other player disconnected. Trying to restore the match…'){
+  if(playMode!=='online')return;
+  const oldConn=conn;conn=null;
+  onlineConnected=false;connectionLost=true;reconnecting=true;
+  stopOnlineHeartbeat();updateModeSubtitle();
+  if(oldConn){try{oldConn.close();}catch{}}
+  renderReconnectMenu(message);
+  scheduleOnlineReconnect(250);
+}
+function tryPeerSignalingReconnect(){
+  if(!peer||peer.destroyed)return false;
+  if(peer.disconnected){try{peer.reconnect();return true;}catch{return false;}}
+  return !!peer.open;
+}
+function connectGuestToHost(){
+  if(playMode!=='online'||onlineRole!==1||!peer?.open||conn?.open)return false;
+  if(conn&&!conn.open){
+    if(Date.now()-connectionAttemptStartedAt<10000)return true;
+    const stale=conn;conn=null;try{stale.close();}catch{}
+  }
+  let outgoing;
+  try{outgoing=peer.connect(roomCode,{reliable:true,metadata:{game:'undership-nations',resume:true}});}catch{return false;}
+  connectionAttemptStartedAt=Date.now();
+  attachOnlineConnection(outgoing,1,false);
+  return true;
+}
+
+function rebuildOnlinePeer(){
+  if(playMode!=='online'||typeof Peer==='undefined')return false;
+  const old=peer;peer=null;try{old?.destroy();}catch{}
+  try{
+    if(onlineRole===0){
+      const p=new Peer(roomCode);peer=p;bindHostPeerEvents(p,true);return true;
+    }
+    const p=new Peer();peer=p;bindGuestPeerEvents(p,true);return true;
+  }catch{return false;}
+}
+function attemptOnlineReconnect(manual=false){
+  if(playMode!=='online'||onlineConnected)return;
+  reconnecting=true;connectionLost=true;updateModeSubtitle();
+  if(navigator.onLine===false){renderReconnectMenu('Waiting for an internet connection…');scheduleOnlineReconnect(2500);return;}
+  reconnectAttempt++;
+  renderReconnectMenu(manual?'Retrying connection now…':`Reconnect attempt ${reconnectAttempt}…`);
+  if(!peer||peer.destroyed){rebuildOnlinePeer();scheduleOnlineReconnect();return;}
+  if(peer.disconnected){tryPeerSignalingReconnect();scheduleOnlineReconnect();return;}
+  if(onlineRole===1){
+    if(!connectGuestToHost())scheduleOnlineReconnect();
+    else scheduleOnlineReconnect();
+    return;
+  }
+  // Hosts keep the stable room ID and wait for Player 2 to reconnect to it.
+  scheduleOnlineReconnect();
+}
+function startOnlineHeartbeat(){
+  stopOnlineHeartbeat();noteOnlineActivity();
+  heartbeatTimer=setInterval(()=>{
+    if(playMode!=='online'||!onlineConnected||!conn?.open||document.hidden)return;
+    const now=Date.now();
+    if(heartbeatAwaitingSince&&now-heartbeatAwaitingSince>ONLINE_STALL_MS){beginOnlineReconnect('The connection stopped responding. Trying to restore it…');return;}
+    try{conn.send({type:'ping',t:now});if(!heartbeatAwaitingSince)heartbeatAwaitingSince=now;}catch{beginOnlineReconnect('The connection could not send data. Trying to restore it…');}
+  },ONLINE_HEARTBEAT_MS);
+}
+function handlePeerDisconnected(p){
+  if(peer!==p||playMode!=='online')return;
+  // PeerJS signaling can drop while an established WebRTC data channel remains healthy.
+  // Reconnect signaling quietly and only interrupt gameplay if the data channel is also gone.
+  try{if(!p.destroyed&&p.disconnected)p.reconnect();}catch{}
+  if(!conn?.open)beginOnlineReconnect('Connection service interrupted. Trying to reconnect…');
+}
+function bindHostPeerEvents(p,isRecovery=false){
+  p.on('open',id=>{
+    if(peer!==p||playMode!=='online')return;
+    roomCode=id;
+    if(connectionLost||isRecovery){reconnecting=true;renderReconnectMenu('Room restored. Waiting for Player 2 to reconnect…');scheduleOnlineReconnect();}
+    else renderHostWaiting('Waiting for Player 2 to join…');
+  });
+  p.on('connection',incoming=>{
+    if(peer!==p||playMode!=='online'){try{incoming.close();}catch{}return;}
+    if(conn?.open&&onlineConnected){try{incoming.close();}catch{}return;}
+    attachOnlineConnection(incoming,0,true);
+  });
+  p.on('disconnected',()=>handlePeerDisconnected(p));
+  p.on('close',()=>{if(peer===p&&playMode==='online')beginOnlineReconnect('The room connection closed. Rebuilding it…');});
+  p.on('error',err=>{
+    if(peer!==p||playMode!=='online')return;
+    if(!connectionLost&&!onlineConnected&&err?.type==='unavailable-id')renderHostWaiting('Room-code collision. Cancel and Host again.');
+    else if(!connectionLost&&!onlineConnected)renderHostWaiting(`Connection service error: ${err?.message||err?.type||'unknown error'}`);
+    else{renderReconnectMenu(`Connection service error: ${err?.message||err?.type||'temporary network error'}. Retrying…`);scheduleOnlineReconnect();}
+  });
+}
+function bindGuestPeerEvents(p,isRecovery=false){
+  p.on('open',()=>{
+    if(peer!==p||playMode!=='online')return;
+    if(isRecovery||connectionLost)renderReconnectMenu('Signaling restored. Rejoining the room…');
+    connectGuestToHost();
+  });
+  p.on('disconnected',()=>handlePeerDisconnected(p));
+  p.on('close',()=>{if(peer===p&&playMode==='online')beginOnlineReconnect('Connection service closed. Rebuilding your connection…');});
+  p.on('error',err=>{
+    if(peer!==p||playMode!=='online')return;
+    if(!connectionLost&&!onlineConnected)renderJoinMenu(`Connection error: ${err?.message||err?.type||'unknown error'}`);
+    else{renderReconnectMenu(`Connection error: ${err?.message||err?.type||'temporary network error'}. Retrying…`);scheduleOnlineReconnect();}
+  });
 }
 function makeRoomCode(){
   const alphabet='abcdefghjkmnpqrstuvwxyz23456789',bytes=new Uint8Array(10);let s='bn-';
@@ -3076,7 +3243,11 @@ async function copyRoomCode(){
   try{await navigator.clipboard.writeText(roomCode);const b=$('#copyRoomCodeBtn');if(b){b.textContent='Copied!';setTimeout(()=>{if(b)b.textContent='Copy Room Code';},1000);}}
   catch{const t=document.createElement('textarea');t.value=roomCode;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove();}
 }
-function destroyPeerConnection(){const oldConn=conn,oldPeer=peer;conn=null;peer=null;onlineConnected=false;try{oldConn?.close();}catch{}try{oldPeer?.destroy();}catch{}}
+function destroyPeerConnection(){
+  clearReconnectTimer();stopOnlineHeartbeat();connectionGeneration++;
+  const oldConn=conn,oldPeer=peer;conn=null;peer=null;onlineConnected=false;reconnecting=false;reconnectAttempt=0;heartbeatAwaitingSince=0;connectionAttemptStartedAt=0;
+  try{oldConn?.close();}catch{}try{oldPeer?.destroy();}catch{}
+}
 function leaveToMenu(confirmFirst=true){
   if(confirmFirst&&playMode!=='menu'&&!confirm('Leave the current game and return to the game mode menu?'))return;
   destroyPeerConnection();playMode='menu';onlineRole=null;roomCode='';connectionLost=false;reset();updateModeSubtitle();renderModeHome();
@@ -3086,23 +3257,20 @@ function startCpuGame(){destroyPeerConnection();playMode='cpu';onlineRole=null;r
 function hostOnlineGame(){
   destroyPeerConnection();
   if(typeof Peer==='undefined'){setModeMenu(`<h2 id="modeMenuTitle">Online Library Unavailable</h2><p>PeerJS could not load. Check your internet connection and reload the page.</p><button type="button" id="joinBackBtn">Back</button>`);$('#joinBackBtn').onclick=renderModeHome;return;}
-  playMode='online';onlineRole=0;onlineConnected=false;connectionLost=false;reset();updateModeSubtitle();roomCode=makeRoomCode();renderHostWaiting('Creating room…');
+  playMode='online';onlineRole=0;onlineConnected=false;connectionLost=false;reconnecting=false;reconnectAttempt=0;reset();updateModeSubtitle();roomCode=makeRoomCode();renderHostWaiting('Creating room…');
   try{peer=new Peer(roomCode);}catch(err){renderHostWaiting(`Could not create room: ${err?.message||err}`);return;}
-  peer.on('open',id=>{roomCode=id;renderHostWaiting('Waiting for Player 2 to join…');});
-  peer.on('connection',incoming=>{if(conn&&onlineConnected){try{incoming.close();}catch{}return;}attachOnlineConnection(incoming,0,true);});
-  peer.on('error',err=>{if(err?.type==='unavailable-id')renderHostWaiting('Room-code collision. Cancel and Host again.');else renderHostWaiting(`Connection service error: ${err?.message||err?.type||'unknown error'}`);});
+  bindHostPeerEvents(peer,false);
 }
 function joinOnlineGame(code){
   code=(code||'').trim().toLowerCase();if(!code){renderJoinMenu('Enter a room code first.');return;}
   if(typeof Peer==='undefined'){renderJoinMenu('PeerJS could not load. Check your internet connection and reload.');return;}
-  destroyPeerConnection();playMode='online';onlineRole=1;onlineConnected=false;connectionLost=false;roomCode=code;reset();updateModeSubtitle();renderConnectingMenu(`Joining ${code}…`);
+  destroyPeerConnection();playMode='online';onlineRole=1;onlineConnected=false;connectionLost=false;reconnecting=false;reconnectAttempt=0;roomCode=code;reset();updateModeSubtitle();renderConnectingMenu(`Joining ${code}…`);
   try{peer=new Peer();}catch(err){renderJoinMenu(`Could not start online connection: ${err?.message||err}`);return;}
-  peer.on('open',()=>{let outgoing;try{outgoing=peer.connect(code,{reliable:true,metadata:{game:'battleship-nations-v7'}});}catch(err){renderJoinMenu(`Could not connect: ${err?.message||err}`);return;}attachOnlineConnection(outgoing,1,false);});
-  peer.on('error',err=>{if(!onlineConnected)renderJoinMenu(`Connection error: ${err?.message||err?.type||'unknown error'}`);});
+  bindGuestPeerEvents(peer,false);
 }
 function encodeGameState(){return JSON.stringify({state,nextId,configuredBudget,configuredBlindPick,playerNames},(key,value)=>value instanceof Set?{__bnSet:[...value]}:value);}
 function decodeGameState(payload){return JSON.parse(payload,(key,value)=>value&&Array.isArray(value.__bnSet)?new Set(value.__bnSet):value);}
-function sendOnlineState(){if(playMode!=='online'||!onlineConnected||!conn?.open||applyingRemoteState)return;try{conn.send({type:'state',payload:encodeGameState()});}catch{}}
+function sendOnlineState(){if(playMode!=='online'||!onlineConnected||!conn?.open||applyingRemoteState)return;try{conn.send({type:'state',payload:encodeGameState()});noteOnlineActivity();}catch{beginOnlineReconnect('Game-state sync was interrupted. Restoring the connection…');}}
 function onlineSimultaneousDeploymentActive(s=state){
   return !!(playMode==='online'&&s?.phase==='setup'&&s?.setupStage==='deployment');
 }
@@ -3169,23 +3337,46 @@ function applyOnlineState(payload){
   if(shouldCheckDeploymentFinish)onlineFinalizeSimultaneousDeploymentIfReady();
 }
 function attachOnlineConnection(c,role,isHost){
-  conn=c;onlineRole=role;
+  const previous=conn;conn=c;onlineRole=role;connectionAttemptStartedAt=Date.now();const generation=++connectionGeneration;
+  if(previous&&previous!==c){try{previous.close();}catch{}}
   c.on('open',()=>{
-    onlineConnected=true;connectionLost=false;hideModeMenu();updateModeSubtitle();
-    if(isHost)sendOnlineState();
-    else try{c.send({type:'playerProfile',name:pendingOnlineName||playerNames[1]});}catch{}
+    if(conn!==c||generation!==connectionGeneration||playMode!=='online')return;
+    onlineConnected=true;connectionLost=false;reconnecting=false;reconnectAttempt=0;connectionAttemptStartedAt=0;clearReconnectTimer();noteOnlineActivity();hideModeMenu();updateModeSubtitle();startOnlineHeartbeat();
+    // Player 2 always announces itself and requests an authoritative resync. During
+    // simultaneous deployment it also sends its local deployment snapshot so the
+    // host can merge any last placement made just before a mobile network drop.
+    if(!isHost){
+      try{c.send({type:'resume',name:pendingOnlineName||playerNames[1],payload:onlineSimultaneousDeploymentActive()?encodeGameState():null});}catch{}
+    }
     render();
   });
   c.on('data',data=>{
+    if(conn!==c||generation!==connectionGeneration||playMode!=='online')return;
+    noteOnlineActivity();
+    if(data?.type==='ping'){try{c.send({type:'pong',t:data.t});}catch{}return;}
+    if(data?.type==='pong')return;
     if(data?.type==='state'&&typeof data.payload==='string')applyOnlineState(data.payload);
+    else if(data?.type==='syncRequest'&&onlineRole===0)sendOnlineState();
+    else if(data?.type==='resume'&&onlineRole===0){
+      playerNames[1]=normalizePlayerName(data.name,'Player 2');
+      if(state?.players?.[1])state.players[1].name=playerNames[1];
+      if(typeof data.payload==='string'&&onlineSimultaneousDeploymentActive())applyOnlineState(data.payload);
+      sendOnlineState();render();
+    }
     else if(data?.type==='playerProfile'&&onlineRole===0){
       playerNames[1]=normalizePlayerName(data.name,'Player 2');
       if(state?.players?.[1])state.players[1].name=playerNames[1];
       sendOnlineState();render();
     }
   });
-  c.on('close',()=>{if(playMode==='online'&&!connectionLost)showConnectionLost();});
-  c.on('error',err=>{if(playMode==='online')showConnectionLost(`Connection error: ${err?.message||'peer connection failed'}`);});
+  c.on('close',()=>{
+    if(conn!==c||generation!==connectionGeneration||playMode!=='online')return;
+    conn=null;connectionAttemptStartedAt=0;beginOnlineReconnect('The other player disconnected. Trying to restore the match…');
+  });
+  c.on('error',err=>{
+    if(conn!==c||generation!==connectionGeneration||playMode!=='online')return;
+    conn=null;connectionAttemptStartedAt=0;beginOnlineReconnect(`Connection error: ${err?.message||'peer connection failed'}. Retrying…`);
+  });
 }
 function onlineSetupActor(){if(state.phase!=='setup')return null;if(['nationReveal','blindNationReveal'].includes(state.setupStage))return 0;return state.setupPlayer;}
 function onlineBattleActor(){
@@ -3197,7 +3388,7 @@ function onlineBattleActor(){
   if(a?.type==='retaliatoryIISelect')return a.attackerId;
   return state.current;
 }
-function localMayAct(){if(playMode!=='online')return true;if(state.phase==='setup')return onlineRole===onlineSetupActor();if(state.phase==='battle')return onlineRole===onlineBattleActor();return true;}
+function localMayAct(){if(playMode!=='online')return true;if(!onlineConnected||reconnecting)return false;if(state.phase==='setup')return onlineRole===onlineSetupActor();if(state.phase==='battle')return onlineRole===onlineBattleActor();return true;}
 function onlineStageName(){if(state.setupStage==='nationSelect')return 'nation selection';if(state.setupStage==='nationReveal'||state.setupStage==='blindNationReveal')return 'nation reveal';if(state.setupStage==='preDeployment')return state.blindPick?'post-reveal Nautical Sanctions':'pre-deployment ability';if(state.setupStage==='blindRedeploy')return 'Blind Pick sanctions redeployment';if(state.setupStage==='deployment')return 'fleet deployment';return 'setup';}
 
 function reset(){deploymentGridSelectMode=false;deploymentShowShipNames=false;gameOverShowShots=false;gameOverShowScans=false;gameOverShowShipNames=false;if(cpuTimer){clearTimeout(cpuTimer);cpuTimer=null;}if(autoTurnTimer){clearTimeout(autoTurnTimer);autoTurnTimer=null;}nextId=1;state={phase:'setup',setupStage:'nationSelect',setupPlayer:0,current:0,turn:1,startingBudget:configuredBudget,blindPick:!!configuredBlindPick,players:[freshPlayer(0),freshPlayer(1)],selectedUnit:null,orientation:'H',action:null,pendingEnd:false,status:`${playerNames[0]||'Player 1'}: choose a faction, then lock it in.`,combatNotice:null,silencedMessages:[],logs:[],winner:null,returnFireQueue:[],returnFireResume:null,sanctionsQueue:[],sanctionsIndex:0,sanctionSelection:null,blindPostRevealSanctions:false,blindAffectedIds:[[],[]],blindRedeployQueue:[],blindRedeployIndex:0,oyVeyApplied:false,turnTransition:null,lastTurnRecap:null,turnLogOwnerId:null,turnLogStart:0,icbmSequence:null,shotHistory:[]};hideHandoff();render();}
@@ -8265,6 +8456,29 @@ resolveCruiseMissile=function(...a){const p=player(),owner=enemy().id,n=p.sonarS
 const fxClearFlare=resolveConfirmedClearWaters;
 resolveConfirmedClearWaters=function(a,chosen,flaring,results){if(flaring)BattleFX.emit('flare',a.defenderId);return fxClearFlare(a,chosen,flaring,results);};
 
+
+// Mobile/browser lifecycle hardening for online matches.
+window.addEventListener('online',()=>{
+  if(playMode!=='online')return;
+  if(onlineConnected&&conn?.open){try{conn.send({type:'ping',t:Date.now()});}catch{}return;}
+  beginOnlineReconnect('Internet connection restored. Rejoining the match…');
+});
+window.addEventListener('offline',()=>{
+  if(playMode==='online')beginOnlineReconnect('Your device went offline. The match is paused until the connection returns.');
+});
+document.addEventListener('visibilitychange',()=>{
+  if(playMode!=='online'||document.hidden)return;
+  // iOS/Android may suspend JavaScript and networking while backgrounded. On
+  // resume, verify the channel immediately instead of waiting for a stale socket.
+  if(!conn?.open||!onlineConnected){beginOnlineReconnect('Welcome back. Restoring the online match…');return;}
+  try{heartbeatAwaitingSince=Date.now();conn.send({type:'ping',t:heartbeatAwaitingSince});if(onlineRole===1)conn.send({type:'syncRequest'});else sendOnlineState();}catch{beginOnlineReconnect('Welcome back. Restoring the online match…');}
+});
+window.addEventListener('pageshow',()=>{
+  if(playMode==='online'&&(!onlineConnected||!conn?.open))beginOnlineReconnect('Restoring the online match after browser resume…');
+});
+window.addEventListener('beforeunload',e=>{
+  if(playMode==='online'&&onlineConnected){e.preventDefault();e.returnValue='';}
+});
 
 reset();
 renderModeHome();
